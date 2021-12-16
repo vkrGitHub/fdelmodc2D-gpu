@@ -1,0 +1,166 @@
+#!/bin/bash
+
+#SBATCH --job-name="green_mGPU"
+#SBATCH --output=jobs/slurm-%A_%a.out
+#SBATCH --error=jobs/slurm-%A_%a.err
+#SBATCH --array=1-1
+#SBATCH --partition=GPUlongB
+#SBATCH --account=cenpes-eng-marchenko
+
+#############################################################################
+# Divide o trabalho horizontalmente, usando apenas dxshot do fdelmodc
+#############################################################################
+
+# Start time
+start_time=$(pydatetimenow.py)
+echo "Job started at $start_time"
+
+# Modules
+module load gcc/7.3.0 cuda/11.0
+export PATH=/scratch/cimatec/victor.ramalho/REPOSITORIES-ogbon/hpc_stuff/parallel_standalone/parallel_installed/bin:$PATH
+
+# Slurm variables
+JID=${SLURM_JOB_ID}; SID=${SLURM_ARRAY_TASK_ID}; SMAX=${SLURM_ARRAY_TASK_MAX}
+#JID=1; SID=1; SMAX=1
+slurmout="jobs/slurm-${JID}_${SID}_gpu{1}.out"
+slurmerr="jobs/slurm-${JID}_${SID}_gpu{1}.err"
+#export OMP_NUM_THREADS=40
+export OMP_NUM_THREADS=1 
+
+# Parameters 
+file_cp=modelLeon_cp.su
+file_den=modelLeon_ro.su
+tmod=1.8
+dxrcv=8.0
+xrcv1=-2000.0
+xrcv2=2000.0
+zrcv1=0.0
+zrcv2=0.0
+dtrcv=0.002
+
+# zfoc0=504.0; zfoc1=504.0; dzfoc=25.0 # 5 pts on z
+zfoc0=100.0; zfoc1=600.0; dzfoc=100.0 # 5 pts on z
+# zfoc0=140.0; zfoc1=1600.0; dzfoc=4.0 # 365 pts on z
+nzfoc=$(awk "BEGIN {print ($zfoc1-($zfoc0))/$dzfoc + 1}")
+dzshot=0 # always zero in this script
+#xfoc0=-808.0; xfoc1=808.0; dxfoc=4.0 # 400 pts on x
+# xfoc0=640.0; xfoc1=652.0; dxfoc=4.0 # 4 pts on x
+xfoc0=-808.0; xfoc1=808.0; dxfoc=404.0 # 4 pts on x -- test
+nxfoc=$(awk "BEGIN {print ($xfoc1-($xfoc0))/$dxfoc + 1}")
+dxshot=$dxfoc	
+echo "nzfoc=$nzfoc nxfoc=$nxfoc"
+
+# Make wavelet
+dt=0.0005
+rec_delay=0.2
+if (( $SID == 1 )); then	
+	makewave fp=20 dt=$dt file_out=wave.su nt=3601 t0=$rec_delay scale=1
+else
+	sleep 2
+fi
+
+# Divide workload
+# Cada no vai fazer um ou mais datums obrigatoriamente
+# Nao pode 2 nós fazendo o mesmo datum
+# Cada GPU vai dentro de um nó vai fazer 1/4 do datum
+#nnode=1
+nnode=$SMAX
+ngpu=4
+
+# Loop de teste em 1 nó, sem sbatch
+# Esse loop sera substituido pela $SID
+# for ((inode=0; inode<$nnode; inode++)); do
+#SID=$inode #MUST DEL
+inode=$(awk "BEGIN {print $SID-1 }")
+mkdir -p jobs/nodeargs$SID/
+
+# Divide datums (z)
+iz0=$(awk "BEGIN {print int(${nzfoc}*(${inode})/${nnode}) }")
+z0=$(awk "BEGIN {print $zfoc0 + ${iz0}*${dzfoc} }") # in meters
+iz1=$(awk "BEGIN {print int(${nzfoc}*(${inode}+1)/${nnode}) }")
+z1=$(awk "BEGIN {print $zfoc0 + (${iz1}-1)*${dzfoc} }") # in meters
+zpts=$(awk "BEGIN {print $iz1-$iz0 }")
+aux=$(( $nnode-1 ))
+#echo "inode=$inode (of $aux) will do datums $iz0 to $iz1 (exclusive)"
+echo "inode=$inode (of $aux) will do datums $z0 to $z1 (inclusive, $zpts datums)"
+
+# Intra-node(GPU) division (x)
+for ((iz=$iz0; iz<$iz1; iz++)); do
+	z=$(awk "BEGIN {print $zfoc0 + (${iz})*${dzfoc} }") # in meters
+	igpu=0
+
+	# Catting config
+	rm -r greens/cat_z${z}.sh
+	echo "#!/bin/bash" >>greens/cat_z${z}.sh
+	a1=0
+	a2=0
+	# Loop
+	for ((igpu=0; igpu<$ngpu; igpu++)); do
+		ix0=$(awk "BEGIN {print int(${nxfoc}*(${igpu})/${ngpu}) }")
+		x0=$(awk "BEGIN {print $xfoc0 + ${ix0}*${dxfoc} }")
+		ix1=$(awk "BEGIN {print int(${nxfoc}*(${igpu}+1)/${ngpu}) }")
+		x1=$(awk "BEGIN {print $xfoc0 + (${ix1}-1)*${dxfoc} }")
+		xpts=$(awk "BEGIN {print $ix1-$ix0 }")
+		aux=$(( $ngpu-1 ))
+		# echo "    igpu=$igpu (of $aux) will do x $ix0 to $ix1 (exclusive)"
+		echo "    igpu=$igpu (of $aux) will do z=$z, x=($x0:$x1) (inclusive, $xpts pts)"
+
+		gnupar_args=jobs/nodeargs$SID/args_node${SID}_iz${iz}.txt
+		fname=greens/greens_z${z}to${z}_x${x0}to${x1}
+		echo "$igpu $fname $z $x0 $xpts" >>$gnupar_args
+
+		# Catting config
+		echo "suchw key1=tracl,fldr key2=tracl,fldr key3=tracl,fldr a=$a1,$a2 f=0,0 <greens_z${z}to${z}_x${x0}to${x1}-gpu_rp.su >tmp.su" >>greens/cat_z${z}.sh
+		echo "cat tmp.su >>greens_z${z}to${z}_x${xfoc0}to${xfoc1}.su" >>greens/cat_z${z}.sh
+		nrcv=$(awk "BEGIN {print ($xrcv2-($xrcv1))/$dxrcv + 1}")
+		a1=$(awk "BEGIN {print ${a1} + ${xpts}*${nrcv}}")
+		a2=$(awk "BEGIN {print $a2 + $xpts }")
+	done #end igpu
+done # end iz
+# done #end inode
+
+# Run
+for ((iz=$iz0; iz<$iz1; iz++)); do
+	gnupar_args=jobs/nodeargs$SID/args_node${SID}_iz${iz}.txt
+
+	# Para cada linha do arquivo abaixo, o gnu parallel vai lancar 1 processo
+	# Logo cada arquivo deve ter sempre 4 linhas (4 gpus por nó)
+	# De forma que o parallel lance 4 procs por nó
+	cat $gnupar_args | parallel --colsep " " fdelmodc2D_singleGPU \
+		igpu={1} \
+		file_cp=$file_cp ischeme=1 iorder=4 \
+		file_den=$file_den \
+		file_src=wave.su \
+		file_rcv={2}.su \
+		src_type=1 \
+		src_orient=1 \
+		src_injectionrate=1 \
+		rec_type_vz=0 \
+		rec_type_p=1 \
+		rec_int_vz=2 \
+		rec_delay=${rec_delay} \
+		dtrcv=${dtrcv} \
+		verbose=1 \
+		tmod=$tmod \
+		dxrcv=$dxrcv \
+		xrcv1=$xrcv1 xrcv2=$xrcv2 \
+		zrcv1=$zrcv1 zrcv2=$zrcv2 \
+		zsrc={3} xsrc={4} \
+		dxshot=$dxshot dzshot=$dzshot \
+		nshot={5} \
+		ntaper=400 \
+		left=4 right=4 top=4 bottom=4 \
+    1\>$slurmout 2\>$slurmerr
+
+done
+
+# Finishing verbose
+end_time=$(pydatetimenow.py)
+total_time=$(pydatetimedif.py "$start_time" "$end_time")
+echo "Job ended at $end_time"
+echo "Job took $total_time"
+
+
+
+
+
